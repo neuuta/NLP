@@ -1,0 +1,11 @@
+Топ 10 слів тексту:
+model: 12
+author: 10
+agent: 9
+discrete: 8
+generation: 6
+motion: 6
+video: 6
+reasoning: 6
+llm: 6
+space: 4
