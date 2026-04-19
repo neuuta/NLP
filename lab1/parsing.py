@@ -1,146 +1,107 @@
 import requests
 from bs4 import BeautifulSoup
-import re
 import pandas as pd
-from datetime import datetime, timedelta
-from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.metrics import accuracy_score, classification_report
+import datetime
 
-# Початок та Конфігурація
-DEPTH_DAYS = 7 # Глибина моніторингу
-OUTPUT_FILE = "output.csv" 
-
-STOP_WORDS = {
-    'і', 'в', 'на', 'з', 'що', 'до', 'як', 'за', 'та', 'про', 'це', 'від', 
-    'але', 'чи', 'й', 'у', 'щоб', 'для', 'а', 'не', 'по', 'під', 'над', 
-    'через', 'при', 'після', 'вже', 'буде', 'був', 'була', 'були', 'його', 
-    'її', 'їх', 'він', 'вона', 'вони', 'ми', 'ви', 'я', 'ти', 'який', 
-    'яка', 'яке', 'які', 'новини', 'тсн', 'укрінформ', 'правда', 'року', 'років', 'рф', 'проти'
-}
-
-# Текстова нормалізація
-def clean_and_tokenize(text):
-    text = text.lower()
-    words = re.findall(r'\b[а-яіїєґ]+\b', text)
-    return [w for w in words if w not in STOP_WORDS and len(w) > 2]
-
-def get_time_slot(hour):
-    if 6 <= hour < 12: return 'Ранок'
-    elif 12 <= hour < 18: return 'День'
-    else: return 'Вечір'
-
-# Точний пошук реального часу на сторінці
-def extract_hour(html_block):
-    # Спочатку шукаємо в тегах часу
-    time_tag = html_block.find(['time', 'span', 'div'], class_=re.compile(r'time|date', re.I))
-    if time_tag:
-        match = re.search(r'\b([0-2]?[0-9]):[0-5][0-9]\b', time_tag.text)
-        if match: return int(match.group(1))
-        
-    # Резервний пошук часу в тексті блоку
-    match = re.search(r'\b([0-2]?[0-9]):[0-5][0-9]\b', html_block.text)
-    if match: return int(match.group(1))
-    return None
-
-# Генерація часової шкали та скрапінг
-def scrape_news(depth_days):
-    today = datetime.now()
-    dates = [today - timedelta(days=i) for i in range(1, depth_days + 1)]
-    all_news = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+# ==========================================
+# 1. Веб-скрапінг сайту pravda.com.ua (через архіви)
+# ==========================================
+def scrape_pravda_news(limit=200):
+    news_data = []
+    seen_links = set()
     
-    for date in dates:
-        print(f"[{date.strftime('%Y-%m-%d')}] Моніторинг новин...")
+    # Починаємо з сьогоднішньої дати
+    current_date = datetime.datetime.now()
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
 
-        urls = [
-            f"https://www.pravda.com.ua/archives/date_{date.strftime('%d%m%Y')}/",
-            f"https://ua.korrespondent.net/all/{date.strftime('%Y-%m-%d')}/"
-        ]
+    print("Починаємо збір новин з архівів...")
+
+    # Гортаємо дні назад, поки не зберемо потрібну кількість новин
+    while len(news_data) < limit:
+        date_str = current_date.strftime('%d%m%Y')
+        url = f"https://www.pravda.com.ua/archives/date_{date_str}/"
         
-        seen_texts = set() # Захист від дублікатів
-        
-        for url in urls:
-            try:
-                response = requests.get(url, headers=headers, timeout=10)
-                soup = BeautifulSoup(response.text, 'lxml')
-                
-                # Шукаємо контейнери з новинами
-                quotes = soup.find_all(['div', 'article'], class_=re.compile(r'news|article|item', re.I))
-                
-                for q in quotes:
-                    a_tag = q.find('a')
-                    if not a_tag: continue
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Шукаємо всі посилання
+            links = soup.find_all('a')
+            
+            for a_tag in links:
+                if len(news_data) >= limit:
+                    break
                     
-                    text = a_tag.text.strip()
-                    # Фільтруємо лише заголовки новин
-                    if 30 < len(text) < 250 and len(text.split()) > 4:
-                        clean_text = re.sub(r'\s+', ' ', text)
-                        
-                        ident = clean_text[:30]
-                        if ident in seen_texts: continue
-                        seen_texts.add(ident)
-                        
-                        tokens = clean_and_tokenize(clean_text)
-                        
-                        if tokens:
-                            hour = extract_hour(q)
-                            if hour is not None:
-                                all_news.append({
-                                    'date': date.strftime('%d.%m.%Y'),
-                                    'time_slot': get_time_slot(hour),
-                                    'tokens': tokens
-                                })
-            except Exception as e:
-                print(f"Помилка скрапінгу {url}: {e}")
+                link = a_tag.get('href', '')
+                title = a_tag.text.strip()
                 
-    return all_news
-
-# Консолідація та структурування аналітичної таблиці
-def build_analytics_table(news_data):
-    df_raw = pd.DataFrame(news_data)
-    results = []
-    
-    if df_raw.empty:
-        return pd.DataFrame()
-        
-    for (date, slot), group in df_raw.groupby(['date', 'time_slot']):
-        all_tokens = []
-        for tokens in group['tokens']:
-            all_tokens.extend(tokens)
+                # Відфільтровуємо порожні посилання та залишаємо лише статті/новини
+                if title and len(title) > 15 and ('/news/' in link or '/articles/' in link or '/columns/' in link):
+                    if link in seen_links:
+                        continue
+                    seen_links.add(link)
+                    
+                    # Евристика: визначаємо категорію (лейбл) на основі URL для "навчання з учителем"
+                    category = 'інше'
+                    if 'epravda' in link or 'economics' in link or 'економік' in title.lower() or 'finance' in link:
+                        category = 'економічна'
+                    elif 'politics' in link or 'rada' in link or 'політик' in title.lower():
+                        category = 'політична'
+                    elif 'life' in link or 'society' in link or 'соціум' in title.lower() or 'health' in link:
+                        category = 'соціальна'
+                        
+                    news_data.append({'text': title, 'category': category})
             
-        counter = Counter(all_tokens)
-        top_5 = counter.most_common(5)
-        
-        if not top_5:
-            continue
+            print(f"Зібрано {len(news_data)} новин (пройдено дату: {current_date.strftime('%d.%m.%Y')})")
             
-        terms = [t[0] for t in top_5]
-        freqs = [t[1] for t in top_5]
+        except Exception as e:
+            print(f"Помилка при завантаженні {url}: {e}")
+            
+        # Переходимо на попередній день
+        current_date -= datetime.timedelta(days=1)
         
-        results.append({
-            'дата': date,
-            'час': slot,
-            'топ-5 термінів': ", ".join(terms),
-            'частота топ-5 тремінів': ", ".join(map(str, freqs)), 
-            'сума топ-5 термінів': sum(freqs)
-        })
-        
-    df_result = pd.DataFrame(results)
-    
-    if not df_result.empty:
-        slot_order = {'Ранок': 1, 'День': 2, 'Вечір': 3}
-        df_result['sort_slot'] = df_result['час'].map(slot_order)
-        df_result['sort_date'] = pd.to_datetime(df_result['дата'], format='%d.%m.%Y')
-        df_result = df_result.sort_values(['sort_date', 'sort_slot']).drop(columns=['sort_slot', 'sort_date'])
-    
-    return df_result
+    return pd.DataFrame(news_data)
 
-if __name__ == '__main__':
-    print("--- Початок скрапінгу ---")
-    news = scrape_news(DEPTH_DAYS)
-    df_final = build_analytics_table(news)
+# Збільшимо ліміт до 250, щоб модель мала більше даних для тренування
+df = scrape_pravda_news(limit=250)
+print(f"\nЗагалом зібрано {len(df)} новин.\n")
+
+if df.empty:
+    print("Помилка: Дані не зібрано. Перевірте підключення або структуру сайту.")
+else:
+    print("Розподіл за категоріями (до збагачення):")
+    print(df['category'].value_counts(), "\n")
+
+    # ==========================================
+    # 2. "Кластеризація" / Класифікація (Навчання з учителем)
+    # ==========================================
     
-    if not df_final.empty:
-        df_final.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
-        print(f"--- Дані збережено у файл {OUTPUT_FILE} ---")
+    # Перевіряємо, чи маємо достатньо різних категорій для навчання (мінімум 2)
+    if len(df['category'].unique()) > 1:
+        vectorizer = TfidfVectorizer(max_features=1000)
+        X = vectorizer.fit_transform(df['text'])
+        y = df['category']
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        model = MultinomialNB()
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_test)
+
+        # ==========================================
+        # 3. Оцінка ефективності (> 60% за методичкою)
+        # ==========================================
+        accuracy = accuracy_score(y_test, y_pred)
+        print(f"Метрика ефективності (Accuracy): {accuracy * 100:.2f}%\n")
+        print("Детальний звіт класифікації:")
+        print(classification_report(y_test, y_pred, zero_division=0))
     else:
-        print("--- Дані не зібрано. ---")
+        print("Зібрано новини лише однієї категорії. Для навчання моделі потрібно зібрати новини хоча б з двох різних рубрик.")
